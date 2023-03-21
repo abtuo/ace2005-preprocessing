@@ -85,9 +85,6 @@ for word in label_word:
     # Token_id.append(word_id)
 
 event_role_id = {}
-none_id = class_label["None"]
-place_id = class_label["Place"]
-time_id = class_label["Time"]
 
 
 def remove_overlap_entities(entities):
@@ -103,11 +100,11 @@ def remove_overlap_entities(entities):
         start, end = entity["start"], entity["end"]
         for i in range(start, end):
             if tokens[i]:
-                id_map[entity["id"]] = tokens[i]
+                id_map[entity["entity-id"]] = tokens[i]
                 continue
         entities_.append(entity)
         for i in range(start, end):
-            tokens[i] = entity["id"]
+            tokens[i] = entity["entity-id"]
     return entities_, id_map
 
 
@@ -453,13 +450,11 @@ def data_to_few_rel_v2(file_list, mode):
     }
 
     for inst in file_list:
-        tokens = inst["tokens"].copy()
-        entities = inst["entity_mentions"]
+        tokens = inst["words"].copy()
+        deps = inst["stanford-colcc"].copy()
+        entities = inst["golden-entity-mentions"]
         sent = inst["sentence"]
         print(sent)
-        deps_parse = dependency_parser.raw_parse(sent)
-        deps = next(deps_parse)
-        deps = deps.nodes.values()
 
         entities, _ = remove_overlap_entities(entities)
 
@@ -468,15 +463,16 @@ def data_to_few_rel_v2(file_list, mode):
         ent_ids = []
 
         for entity in entities:
-            ent_dict[entity["id"]] = (
+            ent_dict[entity["entity-id"]] = (
                 entity["start"],
                 entity["end"],
                 entity["text"],
-                entity["entity_type"],
+                entity["entity-type"],
+                entity["head"],
             )
-            ent_ids.append(entity["id"])
+            ent_ids.append(entity["entity-id"])
 
-        events = inst["event_mentions"]
+        events = inst["golden-event-mentions"]
 
         events.sort(key=lambda x: x["trigger"]["start"])
 
@@ -484,7 +480,7 @@ def data_to_few_rel_v2(file_list, mode):
             inst_args = []
             # Trigger
             trigger = event["trigger"]
-            trigger["id"] = event["id"]
+            trigger["id"] = event["event-id"]
             event_type = event["event_type"]
 
             # args
@@ -492,11 +488,13 @@ def data_to_few_rel_v2(file_list, mode):
             arg_dict = {}
 
             for arg in arguments:
-                arg_dict[arg["entity_id"]] = arg["role"]
+                arg_dict[arg["entity-id"]] = arg["role"]
 
             for cur_ent_id in ent_ids:
-                (ent_start, ent_end, ent_text, ent_type) = ent_dict[cur_ent_id]
-                ent_text = ent_text[0]
+                (ent_start, ent_end, ent_text, ent_type, ent_head) = ent_dict[
+                    cur_ent_id
+                ]
+                ent_text = ent_text
 
                 if cur_ent_id in arg_dict.keys():
                     ent_role = arg_dict[cur_ent_id]
@@ -504,14 +502,20 @@ def data_to_few_rel_v2(file_list, mode):
                         ent_role = "Time"
                 else:
                     ent_role = "None"
-
                 tri_start = trigger["start"]
+                # find entity and trigger heads
+                trigger_doc = nlp(trigger["text"])
+                ent_head_doc = nlp(ent_head["text"])
 
-                print("Trigger:", trigger["text"], tri_start, trigger["end"])
+                trig_head, trig_head_ind = find_head(tri_start, trigger_doc)
+                ent_head, ent_head_ind = find_head(ent_head["start"], ent_head_doc)
+
+                print("Trigger:", trig_head, trig_head_ind)
                 print("Entity:", ent_text, ent_start, ent_end)
-
+                print("Entity head:", ent_head, ent_head_ind)
                 print("Role:", ent_role)
-                print("Dep:", list(deps)[ent_start])
+                dep_path = shortest_dependency_path(trig_head_ind, ent_head_ind, deps)
+
                 print("-" * 50)
                 # tok = " ".join(tokens)
                 # dep = find_dep(tri_start, ent_start, tok)
@@ -988,8 +992,6 @@ def data_stats(file_list, mode):
     return df
 
 
-nlp = spacy.load("en_core_web_sm")
-
 dep_list = {
     "ROOT": "root",
     "acl": "Clausal modifier of noun",
@@ -1039,31 +1041,32 @@ dep_list = {
 }
 
 
-def find_head(arg_start, arg_end, doc):
-    arg_end -= 1
-    cur_i = arg_start
-    while doc[cur_i].head.i >= arg_start and doc[cur_i].head.i <= arg_end:
-        if doc[cur_i].head.i == cur_i:
-            # self is the head
-            break
-        else:
-            cur_i = doc[cur_i].head.i
+def find_head(arg_start, doc):
+    cur_i = 0
+    while doc[cur_i].head.i != cur_i:
+        cur_i = doc[cur_i].head.i
 
-    arg_head = cur_i
-    head_text = doc[arg_head]
-    return head_text
+    head_text = doc[cur_i]
+    arg_head = cur_i + arg_start
+    return head_text, arg_head
 
 
-def shortest_dependency_path(doc, e1=None, e2=None):
+def shortest_dependency_path(e1, e2, doc):
     edges = []
+    dependencies = []
+
     for token in doc:
-        for child in token.children:
-            edges.append((token, child))
+        dep, child, parent = token.split("/")
+        edges.append((int(child.split("=")[-1]), int(parent.split("=")[-1])))
+        dependencies.append(dep)
+
     graph = nx.Graph(edges)
     try:
         shortest_path = nx.shortest_path(graph, source=e1, target=e2)
     except nx.NetworkXNoPath:
         shortest_path = []
+
+    print("Shortest path: ", shortest_path)
 
     # remove non significant dependencies
     aux = [
@@ -1079,19 +1082,23 @@ def shortest_dependency_path(doc, e1=None, e2=None):
         "quantmod",
         "compound",
     ]
+   
+    relation = [dependencies[i] for i in shortest_path]
     try:
-        shortest_path = [i for i in shortest_path if i.dep_ not in aux]
+        relation = [i for i in relation if i not in aux]
     except:
         pass
 
-    if len(shortest_path) == 2:
+    if len(relation) == 2:
         print("Direct dependency")
-        relation = shortest_path[1].dep_
+        relation = dependencies[shortest_path[1]]
         print("Relation: ", relation)
 
-    elif len(shortest_path) > 2:
+    elif len(relation) > 2:
         print("Indirect dependency")
-        relation = [shortest_path[-i].dep_ for i in range(1, len(shortest_path))]
+        relation = [
+            dependencies[shortest_path[-i]] for i in range(1, len(shortest_path))
+        ]
         print("Relation: ", relation)
 
     else:
@@ -1118,6 +1125,21 @@ def find_dep(pos1, pos2, sent):
     print("Word2: ", word2)
 
     return shortest_dependency_path(doc, e1=word1, e2=word2)
+
+
+def load_data(path, max_length=118, ignore_title=False):
+    """Load data from file."""
+    overlength_num = title_num = 0
+    data = []
+    with open(path, "r", encoding="utf-8") as f:
+        r = json.load(f)
+        for line in r:
+            inst = line
+
+            data.append(inst)
+    print("Loaded {} instances from {}".format(len(data), path))
+
+    return data
 
 
 if __name__ == "__main__":

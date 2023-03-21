@@ -56,9 +56,10 @@ def load_data(path, max_length=118, ignore_title=False):
     """Load data from file."""
     overlength_num = title_num = 0
     data = []
-    with open(path, 'r', encoding='utf-8') as r:
+    with open(path, 'r', encoding='utf-8') as f:
+        r = json.load(f)
         for line in r:
-            inst = json.loads(line)
+            inst = line
             inst_len = len(inst['pieces'])
             is_title = inst['sent_id'].endswith('-3') \
                 and inst['tokens'][-1] != '.' \
